@@ -482,6 +482,43 @@ func GetCollectionClient(
 	return client.Database(mongoConfig.Database).Collection(mongoConfig.Collection, collOpts), nil
 }
 
+// buildTLSConfigFromCACert constructs a TLS config from the CA cert and
+// optional client certificate. Returns nil when caCert is nil (TLS disabled).
+func buildTLSConfigFromCACert(caCert []byte, certConfig MongoDBClientTLSCertConfig) (*tls.Config, error) {
+	if caCert == nil {
+		return nil, nil
+	}
+
+	caCertPool := x509.NewCertPool()
+	if !caCertPool.AppendCertsFromPEM(caCert) {
+		return nil, fmt.Errorf("failed to append CA certificate to pool")
+	}
+
+	tlsConfig := &tls.Config{
+		RootCAs:    caCertPool,
+		MinVersion: tls.VersionTLS12,
+	}
+
+	// Load client certificate and key. If the files don't exist, proceed
+	// with CA-only TLS rather than failing.
+	clientCert, err := tls.LoadX509KeyPair(certConfig.TlsCertPath, certConfig.TlsKeyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			slog.Warn("Client certificate or key not found, skipping mTLS",
+				"certPath", certConfig.TlsCertPath,
+				"keyPath", certConfig.TlsKeyPath)
+
+			return tlsConfig, nil
+		}
+
+		return nil, fmt.Errorf("failed to load client certificate and key: %w", err)
+	}
+
+	tlsConfig.Certificates = []tls.Certificate{clientCert}
+
+	return tlsConfig, nil
+}
+
 func constructMongoClientOptions(
 	mongoConfig MongoDBConfig,
 ) (*options.ClientOptions, error) {
@@ -490,56 +527,27 @@ func constructMongoClientOptions(
 		timeout = 600 // 10 minutes by default
 	}
 
-	totalCertTimeout := time.Duration(timeout) * time.Second
-
 	interval := mongoConfig.TotalCACertIntervalSeconds
 	if interval == 0 {
 		interval = 5 // 5 seconds by default
 	}
 
-	intervalCert := time.Duration(interval) * time.Second
-
-	// load CA certificate
-	caCert, err := pollTillCACertIsMountedSuccessfully(mongoConfig.ClientTLSCertConfig.CaCertPath,
-		totalCertTimeout, intervalCert)
+	caCert, err := pollTillCACertIsMountedSuccessfully(
+		mongoConfig.ClientTLSCertConfig.CaCertPath,
+		time.Duration(timeout)*time.Second,
+		time.Duration(interval)*time.Second,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read CA certificate with error: %w", err)
 	}
 
-	// Build TLS config only when CA cert is available
-	var tlsConfig *tls.Config
-	if caCert != nil {
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to append CA certificate to pool")
-		}
-
-		// Load client certificate and key. If the files don't exist, proceed
-		// with CA-only TLS rather than failing.
-		clientCert, err := tls.LoadX509KeyPair(mongoConfig.ClientTLSCertConfig.TlsCertPath,
-			mongoConfig.ClientTLSCertConfig.TlsKeyPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				slog.Warn("Client certificate or key not found, skipping mTLS",
-					"certPath", mongoConfig.ClientTLSCertConfig.TlsCertPath,
-					"keyPath", mongoConfig.ClientTLSCertConfig.TlsKeyPath)
-			} else {
-				return nil, fmt.Errorf("failed to load client certificate and key: %w", err)
-			}
-		}
-
-		tlsConfig = &tls.Config{
-			RootCAs:    caCertPool,
-			MinVersion: tls.VersionTLS12,
-		}
-		if err == nil {
-			tlsConfig.Certificates = []tls.Certificate{clientCert}
-		}
+	tlsConfig, err := buildTLSConfigFromCACert(caCert, mongoConfig.ClientTLSCertConfig)
+	if err != nil {
+		return nil, err
 	}
 
 	clientOpts := options.Client().ApplyURI(mongoConfig.URI)
 
-	// Set AppName for MongoDB connection tracking if provided
 	if mongoConfig.AppName != "" {
 		clientOpts.SetAppName(mongoConfig.AppName)
 	}
@@ -613,8 +621,10 @@ func pollTillCACertIsMountedSuccessfully(certPath string, timeoutInterval time.D
 	pingInterval time.Duration) ([]byte, error) {
 	if certPath == "" {
 		slog.Info("No CA cert path configured, TLS will be disabled")
+
 		return nil, nil
 	}
+
 	if !filepath.IsAbs(certPath) {
 		return nil, fmt.Errorf("CA cert path %q is not absolute — this is likely a misconfiguration. "+
 			"Use --tls-enabled=false to explicitly disable TLS, or provide an absolute cert mount path", certPath)
